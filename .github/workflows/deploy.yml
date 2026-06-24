@@ -1,0 +1,86 @@
+name: CI/CD Pipeline VidalCasino
+
+# El pipeline se disparará SOLO cuando haya un push a la rama 'deploy'
+on:
+  push:
+    branches: [ deploy ]
+  workflow_dispatch: # Permite ejecutarlo a mano desde GitHub
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER: microservicios-eks
+  # ECR Repository name
+  ECR_REPOSITORY: casino-backend
+
+jobs:
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Descargar el código del repo
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar credenciales de AWS (Secretos de GitHub)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 3. Login en Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 4. Construir, etiquetar y subir la imagen Docker a ECR
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Construye la imagen usando el Dockerfile de la raíz
+          docker build -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -t "$REGISTRY/$ECR_REPOSITORY:latest" .
+          # Sube ambas etiquetas a ECR
+          docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: 1. Descargar el código del repo
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar credenciales de AWS (Secretos de GitHub)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 3. Instalar kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+
+      - name: 4. Conectar kubectl al clúster EKS
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: 5. Reemplazar variables en manifiestos y Desplegar
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          
+          # Reemplaza los marcadores <ACCOUNT_ID> y <REGION> en el archivo deployment.yaml por tus datos reales de AWS
+          sed -i "s|<ACCOUNT_ID>|$ACCOUNT_ID|g; s|<REGION>|${{ env.AWS_REGION }}|g; s|:latest|:$IMAGE_TAG|g" k8s/deployment.yaml
+          
+          # Aplica los manifiestos al clúster
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      - name: 6. Verificar Rollout
+        run: |
+          kubectl rollout status deployment/casino-backend --timeout=180s
